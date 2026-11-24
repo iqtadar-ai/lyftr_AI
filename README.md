@@ -8,7 +8,43 @@ Full-stack AI chat application built with **FastAPI**, **LiteLLM**, **SQLite (WA
 - **LLM Gateway (`backend/llm_gateway.py`)**: Rotates across `LLM_API_KEYS` (`key_1`, `key_2`, ...) on HTTP `429` or `5xx` errors, switches provider models automatically by key prefix, and caches identical conversation states in memory (`LLM_CACHE`).
 - **Persistence (`backend/database.py`)**: SQLite database in WAL mode storing chat turns atomically only after successful inference.
 - **Frontend (`frontend/`)**: Responsive React interface with collapsible chat history sidebar, Markdown rendering, active model badge, and telemetry pills.
+## Request & Failover Flow
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as React UI
+    participant API as FastAPI (main.py)
+    participant DB as SQLite (WAL)
+    participant GW as LLM Gateway
+    participant LLM as Groq / Gemini
+
+    User->>API: POST /chat (session_id, message)
+    API->>DB: Fetch prior session messages
+    DB-->>API: Conversation history
+    API->>GW: generate_reply(messages)
+
+    alt SHA-256 Cache Hit (no simulation header)
+        GW-->>API: Cached reply (LLM_CACHE, 0 ms)
+    else Cache Miss
+        loop Rotate through LLM_API_KEYS (key_1 → key_2 → key_3)
+            GW->>LLM: litellm.completion(model, api_key)
+            alt 429 Rate Limit or 5xx Error
+                LLM-->>GW: Retryable failure (increment fallback_attempts)
+            else 200 OK
+                LLM-->>GW: Generated reply + token usage
+            end
+        end
+    end
+
+    alt Inference Succeeded
+        API->>DB: Atomically save user & assistant turn
+        API-->>User: 200 OK (reply + metadata)
+    else All Keys Exhausted
+        Note over API,DB: Skip SQLite write to keep history clean
+        API-->>User: 503 Service Unavailable
+    end
+```
 ## Quick Start (Docker Compose)
 
 1. Stop any local Uvicorn or Vite dev servers occupying ports `8000` or `3000`.
