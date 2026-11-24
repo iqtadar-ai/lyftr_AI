@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from typing import Any, Optional
@@ -5,6 +6,7 @@ from typing import Any, Optional
 import litellm
 from litellm.caching.caching import Cache
 
+logger = logging.getLogger(__name__)
 litellm.drop_params = True
 
 
@@ -127,13 +129,11 @@ def _lookup_pool_cache(
         return None
     for model in models:
         try:
-            cache_key = litellm.cache.get_cache_key(model=model, messages=messages)
-            if not cache_key:
-                continue
-            cached = litellm.cache.get_cache(cache_key)
+            cached = litellm.cache.get_cache(model=model, messages=messages)
             if cached is not None:
                 return model, cached
         except Exception:
+            logger.exception("LiteLLM cache lookup failed for model=%s", model)
             continue
     return None
 
@@ -210,6 +210,12 @@ def generate_reply(
                 fallback_attempts=0 if is_cache_hit else fallback_attempts,
             )
         except Exception:
+            logger.warning(
+                "LLM inference failed on %s (%s); rotating to next key",
+                key_label,
+                model,
+                exc_info=True,
+            )
             fallback_attempts += 1
             continue
 

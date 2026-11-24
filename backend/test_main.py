@@ -1,51 +1,29 @@
-from types import SimpleNamespace
-
 import litellm
 import pytest
 from fastapi.testclient import TestClient
 from litellm.caching.caching import Cache
 
-import llm_gateway
 from main import app
+
+_real_completion = litellm.completion
+
+
+def _mock_completion(**kwargs):
+    return _real_completion(
+        mock_response=f"Reply from {kwargs['model']}", **kwargs
+    )
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    test_db = tmp_path / "test_app.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{test_db}")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'test_app.db'}")
     monkeypatch.setenv("LLM_API_KEYS", "gsk_test_1,gsk_test_2,AIza_test_3")
     monkeypatch.setenv("ENABLE_FAILURE_SIMULATION", "true")
     monkeypatch.setenv("ENABLE_CACHE", "true")
-
     litellm.cache = Cache()
-
-    def fake_completion(model, messages, api_key, **kwargs):
-        cache_opts = kwargs.get("cache") or {}
-        if not cache_opts.get("no-cache") and litellm.cache is not None:
-            ck = litellm.cache.get_cache_key(model=model, messages=messages)
-            cached = litellm.cache.get_cache(ck)
-            if cached is not None:
-                cached._hidden_params = {"cache_hit": True}
-                return cached
-
-        resp = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=f"Reply from {model}")
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10),
-            _hidden_params={},
-        )
-        if not cache_opts.get("no-store") and litellm.cache is not None:
-            ck = litellm.cache.get_cache_key(model=model, messages=messages)
-            litellm.cache.set_cache(ck, resp)
-        return resp
-
-    monkeypatch.setattr(litellm, "completion", fake_completion)
-
-    with TestClient(app) as test_client:
-        yield test_client
+    monkeypatch.setattr(litellm, "completion", _mock_completion)
+    with TestClient(app) as c:
+        yield c
 
 
 def test_health_check(client):
@@ -65,19 +43,16 @@ def test_unknown_session_returns_404(client):
 
 
 def test_validation_limits_return_422(client):
-    # Blank message
     assert (
         client.post("/chat", json={"session_id": "s1", "message": "   "}).status_code
         == 422
     )
-    # Message exceeding 4000 characters
     assert (
         client.post(
             "/chat", json={"session_id": "s1", "message": "a" * 4001}
         ).status_code
         == 422
     )
-    # Session ID exceeding 128 characters
     assert (
         client.post(
             "/chat", json={"session_id": "s" * 129, "message": "hello"}
@@ -135,7 +110,7 @@ def test_cross_provider_failover_to_gemini(client):
     assert meta["fallback_attempts"] == 2
 
 
-def test_litellm_cache_hit_and_post_failover_lookup(client):
+def test_litellm_cache_hit_and_post_failover_lookup(client, monkeypatch):
     first = client.post(
         "/chat", json={"session_id": "cache-1", "message": "Same prompt"}
     ).json()
@@ -148,6 +123,28 @@ def test_litellm_cache_hit_and_post_failover_lookup(client):
     assert second["metadata"]["key_id"] is None
     assert second["metadata"]["fallback_attempts"] == 0
 
+    def groq_down_completion(**kwargs):
+        if kwargs["model"].startswith("groq/"):
+            raise RuntimeError("429 Rate Limit")
+        return _mock_completion(**kwargs)
+
+    monkeypatch.setattr(litellm, "completion", groq_down_completion)
+
+    failover_live = client.post(
+        "/chat", json={"session_id": "cache-fb-1", "message": "Fallback cached prompt"}
+    ).json()
+    assert failover_live["metadata"]["resolution_source"] == "LIVE_INFERENCE"
+    assert failover_live["metadata"]["model"] == "gemini/gemini-3.8-flash"
+    assert failover_live["metadata"]["fallback_attempts"] == 2
+
+    failover_cached = client.post(
+        "/chat", json={"session_id": "cache-fb-2", "message": "Fallback cached prompt"}
+    ).json()
+    assert failover_cached["metadata"]["resolution_source"] == "LLM_CACHE"
+    assert failover_cached["metadata"]["model"] == "gemini/gemini-3.8-flash"
+    assert failover_cached["metadata"]["key_id"] is None
+    assert failover_cached["metadata"]["fallback_attempts"] == 0
+
 
 def test_all_providers_down_does_not_corrupt_history(client):
     res = client.post(
@@ -158,7 +155,6 @@ def test_all_providers_down_does_not_corrupt_history(client):
     assert res.status_code == 503
     assert res.json()["detail"] == "all providers unavailable"
 
-    # Unknown session still returns 404 because nothing was persisted
     hist = client.get("/sessions/down-1/messages")
     assert hist.status_code == 404
     assert hist.json() == {"detail": "session not found"}
