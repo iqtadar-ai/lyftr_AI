@@ -1,4 +1,3 @@
-@"
 # Secrets
 .env
 .env.*
@@ -8,6 +7,7 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
 *.db
 *.db-wal
 *.db-shm
@@ -16,4 +16,3 @@ __pycache__/
 # Node / React
 node_modules/
 frontend/dist/
-"@ | Set-Content -Path .gitignore -Encoding UTF8

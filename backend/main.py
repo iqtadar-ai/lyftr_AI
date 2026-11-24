@@ -1,39 +1,40 @@
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
+load_dotenv()
+
 import database
 import llm_gateway
 
-# Load root .env when running locally (Docker injects env vars directly)
-ROOT_ENV = Path(__file__).resolve().parent.parent / ".env"
-if ROOT_ENV.exists():
-    load_dotenv(ROOT_ENV)
-
-SYSTEM_PROMPT = (
-    "You are a helpful, concise AI assistant. "
-    "Answer clearly and accurately using the conversation history for context."
+DEFAULT_SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "You are Lyftr AI, a clear, accurate, and concise assistant.",
 )
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    """Runs once on startup to ensure the SQLite schema exists."""
+async def lifespan(app: FastAPI):
     database.init_db()
+    llm_gateway.configure_cache()
     yield
 
 
-app = FastAPI(title="Lyftr AI Chatbot API", lifespan=lifespan)
+app = FastAPI(title="Lyftr AI Gateway", lifespan=lifespan)
 
-# Configure CORS from ALLOWED_ORIGINS
-raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
-allowed_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,74 +46,72 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1, max_length=128)
     message: str = Field(..., min_length=1)
+    system_prompt: Optional[str] = Field(default=None, max_length=4000)
 
-    @field_validator("session_id", "message")
+    @field_validator("session_id")
     @classmethod
-    def must_not_be_blank(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("must not be empty or whitespace")
-        return cleaned
+    def validate_session_id(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("session_id must not be blank")
+        if len(trimmed) > 128:
+            raise ValueError("session_id must be at most 128 characters")
+        return trimmed
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("message must not be blank")
+        if len(trimmed) > 4000:
+            raise ValueError("message must be at most 4000 characters")
+        return trimmed
+
+    @field_validator("system_prompt")
+    @classmethod
+    def validate_system_prompt(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        return trimmed if trimmed else None
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    """Returns 200 OK only if SQLite is reachable."""
+def health_check() -> dict[str, Any]:
     if not database.check_db_health():
         raise HTTPException(status_code=503, detail="database unavailable")
-    return {"status": "ok"}
-
-
-@app.get("/sessions/{session_id}/messages")
-def get_messages(session_id: str) -> dict[str, Any]:
-    """Returns chronological chat history for a session (empty list if new)."""
-    messages = database.get_session_messages(session_id)
     return {
-        "session_id": session_id,
-        "messages": messages,
+        "status": "ok",
+        "keys_configured": len(llm_gateway.load_key_pool()),
+        "cache_enabled": llm_gateway.is_cache_enabled(),
     }
-
-@app.get("/sessions")
-def get_sessions() -> dict[str, Any]:
-    """Returns all stored sessions for the sidebar and the primary configured model."""
-    pool = llm_gateway.load_key_pool()
-    default_model = (
-        llm_gateway.resolve_model_for_key(pool[0][1])
-        if pool
-        else os.getenv("GROQ_MODEL", "groq/openai/gpt-oss-20b")
-    )
-    return {
-        "sessions": database.list_sessions(),
-        "default_model": default_model,
-    }
-
-
-@app.delete("/sessions/{session_id}")
-def remove_session(session_id: str) -> dict[str, str]:
-    """Deletes a conversation from SQLite."""
-    database.delete_session(session_id)
-    return {"status": "deleted", "session_id": session_id}
 
 
 @app.post("/chat")
-def chat(
+def chat_endpoint(
     payload: ChatRequest,
-    x_simulate_failure: str | None = Header(default=None, alias="X-Simulate-Failure"),
+    x_simulate_failure: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
-    """
-    Processes one chat turn:
-    1. Loads prior history from SQLite.
-    2. Calls LiteLLM gateway (with cache + key failover).
-    3. Saves user + assistant messages atomically ONLY on success.
-    """
-    history = database.get_session_messages(payload.session_id)
+    try:
+        prior_messages = database.get_session_messages(payload.session_id)
+    except KeyError:
+        prior_messages = []
 
-    # Build the messages array for the LLM (system prompt is NOT saved to SQLite)
-    llm_messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for item in history:
-        llm_messages.append({"role": item["role"], "content": item["content"]})
+    stored_prompt = database.get_session_system_prompt(payload.session_id)
+    effective_system_prompt = (
+        payload.system_prompt
+        if payload.system_prompt is not None
+        else (stored_prompt or DEFAULT_SYSTEM_PROMPT)
+    )
+
+    llm_messages: list[dict[str, str]] = [
+        {"role": "system", "content": effective_system_prompt}
+    ]
+    for msg in prior_messages:
+        llm_messages.append({"role": msg["role"], "content": msg["content"]})
     llm_messages.append({"role": "user", "content": payload.message})
 
     try:
@@ -128,10 +127,23 @@ def chat(
         user_message=payload.message,
         assistant_reply=reply,
         metadata=metadata,
+        system_prompt=payload.system_prompt,
     )
 
     return {
         "session_id": payload.session_id,
         "reply": reply,
         "metadata": metadata,
+    }
+
+
+@app.get("/sessions/{session_id}/messages")
+def session_messages_endpoint(session_id: str) -> dict[str, Any]:
+    try:
+        messages = database.get_session_messages(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {
+        "session_id": session_id,
+        "messages": messages,
     }

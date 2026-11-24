@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import litellm
 import pytest
 from fastapi.testclient import TestClient
+from litellm.caching.caching import Cache
 
-import database
 import llm_gateway
 from main import app
 
@@ -15,18 +15,32 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{test_db}")
     monkeypatch.setenv("LLM_API_KEYS", "gsk_test_1,gsk_test_2,AIza_test_3")
     monkeypatch.setenv("ENABLE_FAILURE_SIMULATION", "true")
+    monkeypatch.setenv("ENABLE_CACHE", "true")
 
-    llm_gateway._RESPONSE_CACHE.clear()
+    litellm.cache = Cache()
 
-    def fake_completion(model, messages, api_key, caching=False):
-        return SimpleNamespace(
+    def fake_completion(model, messages, api_key, **kwargs):
+        cache_opts = kwargs.get("cache") or {}
+        if not cache_opts.get("no-cache") and litellm.cache is not None:
+            ck = litellm.cache.get_cache_key(model=model, messages=messages)
+            cached = litellm.cache.get_cache(ck)
+            if cached is not None:
+                cached._hidden_params = {"cache_hit": True}
+                return cached
+
+        resp = SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(content=f"Reply from {model}")
                 )
             ],
             usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10),
+            _hidden_params={},
         )
+        if not cache_opts.get("no-store") and litellm.cache is not None:
+            ck = litellm.cache.get_cache_key(model=model, messages=messages)
+            litellm.cache.set_cache(ck, resp)
+        return resp
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
 
@@ -37,17 +51,49 @@ def client(tmp_path, monkeypatch):
 def test_health_check(client):
     res = client.get("/health")
     assert res.status_code == 200
-    assert res.json() == {"status": "ok"}
+    assert res.json() == {
+        "status": "ok",
+        "keys_configured": 3,
+        "cache_enabled": True,
+    }
 
 
-def test_rejects_blank_input(client):
-    res = client.post("/chat", json={"session_id": "s1", "message": "   "})
-    assert res.status_code == 422
+def test_unknown_session_returns_404(client):
+    res = client.get("/sessions/does-not-exist/messages")
+    assert res.status_code == 404
+    assert res.json() == {"detail": "session not found"}
 
 
-def test_chat_persistence_and_sidebar_sessions(client):
+def test_validation_limits_return_422(client):
+    # Blank message
+    assert (
+        client.post("/chat", json={"session_id": "s1", "message": "   "}).status_code
+        == 422
+    )
+    # Message exceeding 4000 characters
+    assert (
+        client.post(
+            "/chat", json={"session_id": "s1", "message": "a" * 4001}
+        ).status_code
+        == 422
+    )
+    # Session ID exceeding 128 characters
+    assert (
+        client.post(
+            "/chat", json={"session_id": "s" * 129, "message": "hello"}
+        ).status_code
+        == 422
+    )
+
+
+def test_chat_persistence_and_custom_system_prompt(client):
     res = client.post(
-        "/chat", json={"session_id": "sess-1", "message": "Hello SQLite"}
+        "/chat",
+        json={
+            "session_id": "sess-custom",
+            "message": "Hello SQLite",
+            "system_prompt": "Respond like a pirate.",
+        },
     )
     assert res.status_code == 200
     body = res.json()
@@ -55,22 +101,41 @@ def test_chat_persistence_and_sidebar_sessions(client):
     assert body["metadata"]["resolution_source"] == "LIVE_INFERENCE"
     assert body["metadata"]["key_id"] == "key_1"
 
-    # Verify history endpoint
-    hist = client.get("/sessions/sess-1/messages").json()
-    assert len(hist["messages"]) == 2
-    assert hist["messages"][0]["role"] == "user"
-    assert hist["messages"][1]["role"] == "assistant"
-
-    # Verify sidebar session listing and deletion
-    sessions = client.get("/sessions").json()["sessions"]
-    assert any(s["session_id"] == "sess-1" for s in sessions)
-
-    del_res = client.delete("/sessions/sess-1")
-    assert del_res.status_code == 200
-    assert client.get("/sessions/sess-1/messages").json()["messages"] == []
+    hist = client.get("/sessions/sess-custom/messages")
+    assert hist.status_code == 200
+    msgs = hist.json()["messages"]
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "user"
+    assert msgs[1]["role"] == "assistant"
 
 
-def test_response_cache_hit(client):
+def test_same_provider_failover_key1_to_key2(client):
+    res = client.post(
+        "/chat",
+        headers={"X-Simulate-Failure": "key_1=429"},
+        json={"session_id": "failover-same", "message": "Test key_2"},
+    )
+    assert res.status_code == 200
+    meta = res.json()["metadata"]
+    assert meta["key_id"] == "key_2"
+    assert meta["model"] == "groq/openai/gpt-oss-20b"
+    assert meta["fallback_attempts"] == 1
+
+
+def test_cross_provider_failover_to_gemini(client):
+    res = client.post(
+        "/chat",
+        headers={"X-Simulate-Failure": "key_1=429,key_2=500"},
+        json={"session_id": "failover-cross", "message": "Test key_3"},
+    )
+    assert res.status_code == 200
+    meta = res.json()["metadata"]
+    assert meta["key_id"] == "key_3"
+    assert meta["model"] == "gemini/gemini-3.8-flash"
+    assert meta["fallback_attempts"] == 2
+
+
+def test_litellm_cache_hit_and_post_failover_lookup(client):
     first = client.post(
         "/chat", json={"session_id": "cache-1", "message": "Same prompt"}
     ).json()
@@ -84,19 +149,6 @@ def test_response_cache_hit(client):
     assert second["metadata"]["fallback_attempts"] == 0
 
 
-def test_simulated_cross_provider_failover(client):
-    res = client.post(
-        "/chat",
-        headers={"X-Simulate-Failure": "key_1=429,key_2=500"},
-        json={"session_id": "failover-1", "message": "Test failover"},
-    )
-    assert res.status_code == 200
-    meta = res.json()["metadata"]
-    assert meta["key_id"] == "key_3"
-    assert meta["model"] == "gemini/gemini-3.8-flash"
-    assert meta["fallback_attempts"] == 2
-
-
 def test_all_providers_down_does_not_corrupt_history(client):
     res = client.post(
         "/chat",
@@ -106,6 +158,7 @@ def test_all_providers_down_does_not_corrupt_history(client):
     assert res.status_code == 503
     assert res.json()["detail"] == "all providers unavailable"
 
-    # Confirm nothing was written to SQLite on failure
-    hist = client.get("/sessions/down-1/messages").json()
-    assert hist["messages"] == []
+    # Unknown session still returns 404 because nothing was persisted
+    hist = client.get("/sessions/down-1/messages")
+    assert hist.status_code == 404
+    assert hist.json() == {"detail": "session not found"}

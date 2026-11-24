@@ -1,204 +1,206 @@
-import hashlib
-import json
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
 import litellm
-from litellm.exceptions import (
-    APIConnectionError,
-    APIError,
-    InternalServerError,
-    RateLimitError,
-    ServiceUnavailableError,
-    Timeout,
-)
+from litellm.caching.caching import Cache
 
-# Turn off noisy LiteLLM debug logs in the terminal
-litellm.suppress_debug_info = True
+litellm.drop_params = True
 
-# In-memory response cache keyed by SHA-256 hash of (model, messages)
-_RESPONSE_CACHE: dict[str, dict[str, Any]] = {}
-CACHE_ENABLED = True
 
-VALID_SIMULATED_STATUSES = {429, 500, 502, 503}
+def configure_cache() -> bool:
+    """Initializes LiteLLM's built-in in-memory cache unless disabled."""
+    enabled = os.getenv("ENABLE_CACHE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if enabled:
+        if litellm.cache is None:
+            litellm.cache = Cache()
+    else:
+        litellm.cache = None
+    return enabled
+
+
+configure_cache()
 
 
 class AllProvidersUnavailableError(Exception):
     """Raised when every configured API key fails."""
 
 
+def is_cache_enabled() -> bool:
+    return litellm.cache is not None
+
+
+def load_key_pool() -> list[tuple[str, str]]:
+    """Parses LLM_API_KEYS into [(key_1, raw_key), (key_2, raw_key), ...]."""
+    raw = os.getenv("LLM_API_KEYS", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    return [(f"key_{idx + 1}", key) for idx, key in enumerate(keys)]
+
+
 def resolve_model_for_key(api_key: str) -> str:
-    """Picks the right LiteLLM model based on the API key's provider prefix."""
+    """Maps key prefixes to their provider-specific LiteLLM model IDs."""
     if api_key.startswith("gsk_"):
         return os.getenv("GROQ_MODEL", "groq/openai/gpt-oss-20b").strip()
     if api_key.startswith(("AIza", "AQ.")):
         return os.getenv("GEMINI_MODEL", "gemini/gemini-3.8-flash").strip()
-    return os.getenv("LLM_MODEL", "groq/openai/gpt-oss-20b").strip()
+    return os.getenv("GROQ_MODEL", "groq/openai/gpt-oss-20b").strip()
 
 
-def load_key_pool() -> list[tuple[str, str]]:
-    """
-    Reads LLM_API_KEYS from the environment and assigns key_1, key_2, ... in order.
-    Example: 'abc,def' -> [('key_1', 'abc'), ('key_2', 'def')]
-    """
-    raw_keys = os.getenv("LLM_API_KEYS", "")
-    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    return [(f"key_{idx}", key) for idx, key in enumerate(keys, start=1)]
-
-
-def is_failure_simulation_enabled() -> bool:
-    """Checks whether X-Simulate-Failure is allowed by environment config."""
-    return os.getenv("ENABLE_FAILURE_SIMULATION", "false").strip().lower() == "true"
-
-
-def parse_failure_header(header_value: str | None) -> dict[str, int]:
-    """
-    Parses 'X-Simulate-Failure' header into a dictionary.
-    Examples:
-      'key_1=429'            -> {'key_1': 429}
-      'key_1=429, key_2=500' -> {'key_1': 429, 'key_2': 500}
-      '*=429'                -> {'*': 429}
-    """
-    if not header_value or not is_failure_simulation_enabled():
+def parse_failure_simulation(header_value: Optional[str]) -> dict[str, int]:
+    """Parses 'key_1=429,key_2=500' or '*=429' when simulation is enabled."""
+    if not header_value:
+        return {}
+    enabled = os.getenv("ENABLE_FAILURE_SIMULATION", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
         return {}
 
-    simulated: dict[str, int] = {}
-    for part in header_value.split(","):
-        part = part.strip()
+    rules: dict[str, int] = {}
+    for item in header_value.split(","):
+        part = item.strip()
         if "=" not in part:
             continue
-        key_id, status_str = part.split("=", 1)
-        key_id = key_id.strip()
+        target, code_str = part.split("=", 1)
+        target = target.strip()
         try:
-            status_code = int(status_str.strip())
+            rules[target] = int(code_str.strip())
         except ValueError:
             continue
-        if status_code in VALID_SIMULATED_STATUSES:
-            simulated[key_id] = status_code
-
-    return simulated
+    return rules
 
 
-def _make_cache_key(model: str, messages: list[dict[str, str]]) -> str:
-    """Creates a deterministic SHA-256 key from the model name and full message history."""
-    payload = json.dumps({"model": model, "messages": messages}, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def _extract_response_payload(
+    response: Any,
+    model: str,
+    resolution_source: str,
+    key_id: Optional[str],
+    latency_ms: int,
+    fallback_attempts: int,
+) -> tuple[str, dict[str, Any]]:
+    content = ""
+    choices = getattr(response, "choices", None) or []
+    if choices:
+        msg = getattr(choices[0], "message", None)
+        content = (getattr(msg, "content", None) or "").strip()
+
+    usage = getattr(response, "usage", None)
+    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+
+    metadata: dict[str, Any] = {
+        "resolution_source": resolution_source,
+        "model": model,
+        "key_id": key_id,
+        "latency_ms": latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "fallback_attempts": fallback_attempts,
+    }
+    return content, metadata
 
 
-def _is_retryable_error(exc: Exception) -> bool:
+def _lookup_pool_cache(
+    models: list[str], messages: list[dict[str, str]]
+) -> Optional[tuple[str, Any]]:
     """
-    Returns True if the error is a rate limit (429), quota issue, or 5xx server error
-    that should trigger failover to the next API key.
+    Checks LiteLLM's built-in cache across all unique configured models
+    so replies previously stored under a fallback model still hit.
     """
-    if isinstance(
-        exc,
-        (
-            RateLimitError,
-            ServiceUnavailableError,
-            InternalServerError,
-            APIConnectionError,
-            Timeout,
-        ),
-    ):
-        return True
-
-    if isinstance(exc, APIError):
-        status = getattr(exc, "status_code", None)
-        if status == 429 or (isinstance(status, int) and status >= 500):
-            return True
-
-    msg = str(exc).lower()
-    if any(word in msg for word in ("429", "rate limit", "quota", "resource exhausted")):
-        return True
-
-    return False
+    if litellm.cache is None:
+        return None
+    for model in models:
+        try:
+            cache_key = litellm.cache.get_cache_key(model=model, messages=messages)
+            cached = litellm.cache.get_cache(cache_key)
+            if cached is not None:
+                return model, cached
+        except Exception:
+            continue
+    return None
 
 
 def generate_reply(
     messages: list[dict[str, str]],
-    simulate_failure_header: str | None = None,
+    simulate_failure_header: Optional[str] = None,
 ) -> tuple[str, dict[str, Any]]:
     """
-    Sends the conversation to LiteLLM with caching and automatic key failover.
-    Returns (reply_text, metadata_dict).
-    Raises AllProvidersUnavailableError if every key fails.
+    Executes chat completion through LiteLLM with built-in caching
+    and sequential API key + cross-provider failover.
     """
-    key_pool = load_key_pool()
-    if not key_pool:
-        raise AllProvidersUnavailableError("all providers unavailable")
+    pool = load_key_pool()
+    if not pool:
+        raise AllProvidersUnavailableError("No LLM API keys configured.")
 
-    simulated_failures = parse_failure_header(simulate_failure_header)
-    use_cache = CACHE_ENABLED and len(simulated_failures) == 0
+    sim_rules = parse_failure_simulation(simulate_failure_header)
+    is_simulating = bool(sim_rules)
 
-    start_time = time.perf_counter()
+    unique_models: list[str] = []
+    for _, raw_key in pool:
+        m = resolve_model_for_key(raw_key)
+        if m not in unique_models:
+            unique_models.append(m)
 
-    # 1. Check in-memory cache first (using the primary key's model)
-    primary_model = resolve_model_for_key(key_pool[0][1])
-    if use_cache:
-        cache_key = _make_cache_key(primary_model, messages)
-        cached = _RESPONSE_CACHE.get(cache_key)
-        if cached is not None:
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
-            return cached["reply"], {
-                "resolution_source": "LLM_CACHE",
-                "model": cached["model"],
-                "latency_ms": latency_ms,
-                "input_tokens": cached["input_tokens"],
-                "output_tokens": cached["output_tokens"],
-                "key_id": None,
-                "fallback_attempts": 0,
-            }
+    # Check LiteLLM's cache across configured models (including fallback models)
+    if not is_simulating and litellm.cache is not None:
+        start = time.perf_counter()
+        cached_hit = _lookup_pool_cache(unique_models, messages)
+        if cached_hit is not None:
+            cached_model, cached_resp = cached_hit
+            latency_ms = int(round((time.perf_counter() - start) * 1000))
+            return _extract_response_payload(
+                response=cached_resp,
+                model=cached_model,
+                resolution_source="LLM_CACHE",
+                key_id=None,
+                latency_ms=latency_ms,
+                fallback_attempts=0,
+            )
 
-    # 2. Live inference with key failover loop
     fallback_attempts = 0
+    for key_label, raw_key in pool:
+        model = resolve_model_for_key(raw_key)
+        start = time.perf_counter()
 
-    for key_id, api_key in key_pool:
-        if "*" in simulated_failures or key_id in simulated_failures:
+        # Simulated failure injection
+        sim_status = sim_rules.get(key_label) or sim_rules.get("*")
+        if sim_status is not None:
             fallback_attempts += 1
             continue
-
-        model = resolve_model_for_key(api_key)
 
         try:
-            response = litellm.completion(
+            call_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "api_key": raw_key,
+            }
+            if is_simulating:
+                call_kwargs["cache"] = {"no-cache": True, "no-store": True}
+
+            response = litellm.completion(**call_kwargs)
+            latency_ms = int(round((time.perf_counter() - start) * 1000))
+
+            hidden = getattr(response, "_hidden_params", None) or {}
+            is_cache_hit = bool(hidden.get("cache_hit")) and not is_simulating
+
+            return _extract_response_payload(
+                response=response,
                 model=model,
-                messages=messages,
-                api_key=api_key,
-                caching=False,
+                resolution_source="LLM_CACHE" if is_cache_hit else "LIVE_INFERENCE",
+                key_id=None if is_cache_hit else key_label,
+                latency_ms=latency_ms,
+                fallback_attempts=0 if is_cache_hit else fallback_attempts,
             )
-        except Exception as exc:
-            if _is_retryable_error(exc):
-                fallback_attempts += 1
-                continue
+        except Exception:
             fallback_attempts += 1
             continue
-
-        latency_ms = int((time.perf_counter() - start_time) * 1000)
-        reply_text = (response.choices[0].message.content or "").strip()
-        usage = getattr(response, "usage", None)
-        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-
-        # Save to cache for identical future requests
-        if CACHE_ENABLED:
-            cache_key = _make_cache_key(model, messages)
-            _RESPONSE_CACHE[cache_key] = {
-                "reply": reply_text,
-                "model": model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-            }
-
-        metadata = {
-            "resolution_source": "LIVE_INFERENCE",
-            "model": model,
-            "latency_ms": latency_ms,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "key_id": key_id,
-            "fallback_attempts": fallback_attempts,
-        }
-        return reply_text, metadata
 
     raise AllProvidersUnavailableError("all providers unavailable")
