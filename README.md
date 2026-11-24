@@ -45,7 +45,35 @@ sequenceDiagram
         API-->>User: 503 Service Unavailable
     end
 ```
+
+
 ## Quick Start (Docker Compose)
+
+
+## Container & Persistence Topology
+
+```mermaid
+flowchart LR
+    Browser["Browser Client"]
+
+    subgraph Docker["Docker Compose Network"]
+        FE["lyftr-frontend\nNginx (3000 → 80)"]
+        BE["lyftr-backend\nFastAPI + LiteLLM (8000 → 8000)"]
+        VOL[("sqlite_data Volume\n/data/app.db (WAL)")]
+    end
+
+    subgraph Providers["External LLM Providers"]
+        GROQ["Groq API\n(key_1, key_2)"]
+        GEMINI["Gemini API\n(key_3 fallback)"]
+    end
+
+    Browser -- "GET / (Static SPA)" --> FE
+    Browser -- "REST (/chat, /sessions, /health)" --> BE
+    BE <-- "Atomic Turn Persistence" --> VOL
+    BE -- "Primary Inference" --> GROQ
+    BE -. "Failover on 429 / 5xx" .-> GEMINI
+```
+
 
 1. Stop any local Uvicorn or Vite dev servers occupying ports `8000` or `3000`.
 2. Copy `.env.example` to `.env` and add your API keys:
