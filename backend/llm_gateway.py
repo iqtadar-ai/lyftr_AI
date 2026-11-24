@@ -78,6 +78,14 @@ def parse_failure_simulation(header_value: Optional[str]) -> dict[str, int]:
     return rules
 
 
+def _get_field(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def _extract_response_payload(
     response: Any,
     model: str,
@@ -87,14 +95,14 @@ def _extract_response_payload(
     fallback_attempts: int,
 ) -> tuple[str, dict[str, Any]]:
     content = ""
-    choices = getattr(response, "choices", None) or []
+    choices = _get_field(response, "choices") or []
     if choices:
-        msg = getattr(choices[0], "message", None)
-        content = (getattr(msg, "content", None) or "").strip()
+        msg = _get_field(choices[0], "message")
+        content = (_get_field(msg, "content") or "").strip()
 
-    usage = getattr(response, "usage", None)
-    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    usage = _get_field(response, "usage")
+    input_tokens = int(_get_field(usage, "prompt_tokens", 0) or 0)
+    output_tokens = int(_get_field(usage, "completion_tokens", 0) or 0)
 
     metadata: dict[str, Any] = {
         "resolution_source": resolution_source,
@@ -120,6 +128,8 @@ def _lookup_pool_cache(
     for model in models:
         try:
             cache_key = litellm.cache.get_cache_key(model=model, messages=messages)
+            if not cache_key:
+                continue
             cached = litellm.cache.get_cache(cache_key)
             if cached is not None:
                 return model, cached
@@ -188,8 +198,8 @@ def generate_reply(
             response = litellm.completion(**call_kwargs)
             latency_ms = int(round((time.perf_counter() - start) * 1000))
 
-            hidden = getattr(response, "_hidden_params", None) or {}
-            is_cache_hit = bool(hidden.get("cache_hit")) and not is_simulating
+            hidden = _get_field(response, "_hidden_params") or {}
+            is_cache_hit = bool(_get_field(hidden, "cache_hit")) and not is_simulating
 
             return _extract_response_payload(
                 response=response,
