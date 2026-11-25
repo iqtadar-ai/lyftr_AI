@@ -90,6 +90,32 @@ sequenceDiagram
         API-->>User: 503 Service Unavailable
     end
 ```
+
+
+
+## Container & Persistence Topology
+
+```mermaid
+flowchart LR
+    Browser["Browser Client"]
+
+    subgraph Docker["Docker Compose Network"]
+        FE["lyftr-frontend<br/>Nginx (3000 → 80)"]
+        BE["lyftr-backend<br/>FastAPI + LiteLLM (8000 → 8000)"]
+        VOL[("sqlite_data Volume<br/>/data/app.db (WAL)")]
+    end
+
+    subgraph Providers["External LLM Providers"]
+        GROQ["Groq API<br/>(key_1, key_2)"]
+        GEMINI["Gemini API<br/>(key_3 fallback)"]
+    end
+
+    Browser -->|"GET / (Static SPA)"| FE
+    Browser -->|"REST (/chat, /sessions, /health)"| BE
+    BE <-->|"Atomic Turn Persistence"| VOL
+    BE -->|"Primary Inference"| GROQ
+    BE -.->|"Failover on 429 / 5xx"| GEMINI
+```
 ## Verification
 
 1. **Health endpoint:**
