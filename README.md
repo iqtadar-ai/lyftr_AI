@@ -106,8 +106,8 @@ flowchart LR
     end
 
     subgraph Providers["External LLM Providers"]
-        GROQ["Groq API<br/>(key_1, key_2)"]
-        GEMINI["Gemini API<br/>(key_3 fallback)"]
+        GROQ["Groq API<br/>(key_1)"]
+        GEMINI["Gemini API<br/>(key_2 fallback)"]
     end
 
     Browser -->|"GET / (Static SPA)"| FE
